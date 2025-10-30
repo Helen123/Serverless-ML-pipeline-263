@@ -58,6 +58,7 @@ Build an end-to-end Serverless Machine Learning (ML) pipeline that automates dat
 | Model Registration + Deployment |||
 | Monitoring Dashboard | ||
 | CloudWatch Alerts + Slack | ||
+| AWS IAM & S3 Permissions | ✅ Done | Admin profile configured; unique S3 bucket created and versioned |
 
 ---
 
