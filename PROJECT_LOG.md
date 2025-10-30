@@ -27,6 +27,10 @@ Build an end-to-end Serverless Machine Learning (ML) pipeline that automates dat
 - Features: `area_sqft`, `lat`, `lon`, `built_year`, `type`, plus derived columns (`distance_to_downtown_km`, `area_sqft_sq`, etc.)
 - Volume: Up to 1M records/day (batch jobs handle scalability)
 
+- Additional Dataset (Planned): **NYC Yellow Taxi Trip Data**   
+  Rationale: High-volume, real-world tabular data suitable for benchmarking serverless ETL (cleaning/feature engineering) and batch inference patterns.  
+  Notes: Large monthly Parquet/CSV files; will validate schema, sampling strategy, and S3 partitioning (by `year/month`) before integration.
+
 ###  ML Framework 
 - Algorithm: **XGBoost (SageMaker built-in)**  (for House Price Prediction)  
 - Training trigger: Step Functions Task (`createTrainingJob`)
