@@ -2,7 +2,8 @@ FROM public.ecr.aws/lambda/python:3.11-arm64
 
 # Install Python dependencies into Lambda task root
 COPY lambdas/clean_transform/requirements.txt .
-RUN pip3.11 install -r requirements.txt --target "${LAMBDA_TASK_ROOT}" \
+RUN pip3.11 install --upgrade pip \
+	&& pip3.11 install -r requirements.txt --target "${LAMBDA_TASK_ROOT}" \
 	&& rm -f requirements.txt
 
 # Copy function code
