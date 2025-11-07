@@ -50,14 +50,14 @@ Build an end-to-end Serverless Machine Learning (ML) pipeline that automates dat
 ## check table 
 | Component | Status | Notes |
 |------------|--------|-------|
-| Data Scope & Schema |||
-| Lambda for Cleaning | ||
-| Feature Engineering Lambda |||
-| Step Functions Definition | ||
-| SageMaker Training Job | ||
-| Model Registration + Deployment |||
-| Monitoring Dashboard | ||
-| CloudWatch Alerts + Slack | ||
+| Data Scope & Schema | ✅ Done | California Housing dataset; housing transaction data schema defined |
+| Lambda for Cleaning | ✅ Done | EventBridge-triggered Lambda cleans data (removes price=0, standardizes units), outputs to processed/ |
+| Feature Engineering Lambda | 🔵 Planned | Next to implement |
+| Step Functions Definition | 🔵 Planned | CDK stack to be created |
+| SageMaker Training Job | 🔵 Planned | XGBoost config needed |
+| Model Registration + Deployment | 🔵 Planned | DynamoDB integration |
+| Monitoring Dashboard | 🔵 Planned | CloudWatch metrics |
+| CloudWatch Alerts + Slack | 🔵 Planned | SNS webhook |
 
 ---
 
