@@ -121,20 +121,31 @@ def clean_housing_data(df):
     df_cleaned = df.copy()
     
     # Step 1: Standardize field names (case-insensitive, common variations)
+    # Handle both California Housing dataset and general housing data
     column_mapping = {}
     for col in df_cleaned.columns:
         col_lower = col.lower().strip()
-        # Map common variations to standard names
-        if 'price' in col_lower or 'value' in col_lower:
+        # Map common variations to standard names (more specific matching)
+        if col_lower in ['medhouseval', 'medhousevalue'] or ('price' in col_lower and 'med' not in col_lower) or ('value' in col_lower and 'med' not in col_lower):
             column_mapping[col] = 'price'
+        elif col_lower in ['medinc', 'medianincome', 'income']:
+            column_mapping[col] = 'med_inc'
         elif 'area' in col_lower or 'sqft' in col_lower or 'sq_ft' in col_lower:
             column_mapping[col] = 'area_sqft'
-        elif 'age' in col_lower or 'year' in col_lower:
+        elif col_lower in ['houseage', 'age']:
             column_mapping[col] = 'house_age'
-        elif 'lat' in col_lower:
+        elif col_lower == 'latitude' or col_lower == 'lat':
             column_mapping[col] = 'latitude'
-        elif 'lon' in col_lower or 'lng' in col_lower:
+        elif col_lower in ['longitude', 'lon', 'lng']:
             column_mapping[col] = 'longitude'
+        elif col_lower in ['averooms', 'rooms']:
+            column_mapping[col] = 'ave_rooms'
+        elif col_lower in ['avebedrms', 'bedrooms']:
+            column_mapping[col] = 'ave_bedrms'
+        elif col_lower == 'population':
+            column_mapping[col] = 'population'
+        elif col_lower in ['aveoccup', 'occupancy']:
+            column_mapping[col] = 'ave_occup'
         elif 'type' in col_lower:
             column_mapping[col] = 'house_type'
     
@@ -148,13 +159,22 @@ def clean_housing_data(df):
     logger.info(f"After removing duplicates: {df_cleaned.shape[0]} rows (dropped {initial_rows - len(df_cleaned)})")
     
     # Step 3: Handle missing values - drop rows with missing critical fields
-    critical_fields = ['price']
+    # Build list of critical fields that actually exist in the dataframe
+    critical_fields = []
+    if 'price' in df_cleaned.columns:
+        critical_fields.append('price')
     if 'area_sqft' in df_cleaned.columns:
         critical_fields.append('area_sqft')
     
-    missing_before = len(df_cleaned)
-    df_cleaned = df_cleaned.dropna(subset=critical_fields)
-    logger.info(f"After removing missing critical fields: {df_cleaned.shape[0]} rows (dropped {missing_before - len(df_cleaned)})")
+    if critical_fields:
+        missing_before = len(df_cleaned)
+        df_cleaned = df_cleaned.dropna(subset=critical_fields)
+        logger.info(f"After removing missing critical fields: {df_cleaned.shape[0]} rows (dropped {missing_before - len(df_cleaned)})")
+    else:
+        # If no critical fields found, just drop rows with any missing values
+        missing_before = len(df_cleaned)
+        df_cleaned = df_cleaned.dropna()
+        logger.info(f"After removing missing values: {df_cleaned.shape[0]} rows (dropped {missing_before - len(df_cleaned)})")
     
     # Step 4: Remove abnormal values (price = 0 or negative)
     if 'price' in df_cleaned.columns:
@@ -178,8 +198,8 @@ def clean_housing_data(df):
         # Remove negative or zero area
         df_cleaned = df_cleaned[df_cleaned['area_sqm'] > 0]
     
-    # Remove negative values for other positive features
-    positive_features = ['house_age', 'latitude', 'longitude']
+    # Remove negative values for other positive features (but not longitude which can be negative)
+    positive_features = ['house_age', 'latitude', 'med_inc', 'ave_rooms', 'ave_bedrms', 'population', 'ave_occup']
     for col in positive_features:
         if col in df_cleaned.columns:
             initial_count = len(df_cleaned)
@@ -187,6 +207,17 @@ def clean_housing_data(df):
             dropped = initial_count - len(df_cleaned)
             if dropped > 0:
                 logger.info(f"Dropped {dropped} rows with non-positive {col}")
+    
+    # Validate longitude bounds (California: -124.5 to -114, but allow negative values)
+    if 'longitude' in df_cleaned.columns:
+        initial_count = len(df_cleaned)
+        df_cleaned = df_cleaned[
+            (df_cleaned['longitude'] >= -180) & 
+            (df_cleaned['longitude'] <= 180)
+        ]
+        dropped = initial_count - len(df_cleaned)
+        if dropped > 0:
+            logger.info(f"Dropped {dropped} rows with invalid longitude")
     
     # Reset index after cleaning
     df_cleaned = df_cleaned.reset_index(drop=True)
