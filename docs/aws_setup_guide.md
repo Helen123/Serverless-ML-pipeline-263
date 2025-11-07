@@ -175,8 +175,140 @@ aws s3api put-bucket-notification-configuration \
 ```
 
 
+## Feature Engineering Lambda Setup
+
+### 10. Create IAM Role for Feature Engineering Lambda
+```bash
+export FEATURE_ROLE_NAME=FeatureBuildLambdaRole
+export FEATURE_FUNCTION_NAME=FeatureBuild
+
+# Create trust policy
+cat > /tmp/feature-lambda-trust-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "lambda.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
+
+# Create the role
+aws iam create-role \
+  --role-name $FEATURE_ROLE_NAME \
+  --assume-role-policy-document file:///tmp/feature-lambda-trust-policy.json
+
+# Attach basic Lambda execution policy
+aws iam attach-role-policy \
+  --role-name $FEATURE_ROLE_NAME \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+# Create S3 access policy for feature Lambda
+cat > /tmp/feature-s3-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": "arn:aws:s3:::${BUCKET}/processed/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject"],
+      "Resource": "arn:aws:s3:::${BUCKET}/feature_store/*"
+    }
+  ]
+}
+EOF
+
+# Attach S3 policy to role
+aws iam put-role-policy \
+  --role-name $FEATURE_ROLE_NAME \
+  --policy-name S3AccessPolicy \
+  --policy-document file:///tmp/feature-s3-policy.json
+
+# Get role ARN
+export FEATURE_ROLE_ARN=$(aws iam get-role --role-name $FEATURE_ROLE_NAME --query 'Role.Arn' --output text)
+```
+
+### 11. Build and Push Feature Engineering Lambda Image
+```bash
+export FEATURE_REPO=feature-build
+
+# Create ECR repository
+aws ecr create-repository --repository-name $FEATURE_REPO 2>/dev/null || echo "Repo already exists"
+
+# Build and push
+docker buildx build \
+  --platform linux/arm64 \
+  --provenance=false \
+  --sbom=false \
+  --push \
+  -f Dockerfile.feature \
+  -t ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${FEATURE_REPO}:latest \
+  .
+
+export FEATURE_IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${FEATURE_REPO}:latest"
+```
+
+### 12. Create Feature Engineering Lambda Function
+```bash
+aws lambda create-function \
+  --function-name $FEATURE_FUNCTION_NAME \
+  --package-type Image \
+  --code ImageUri=$FEATURE_IMAGE_URI \
+  --role $FEATURE_ROLE_ARN \
+  --architectures arm64 \
+  --memory-size 1024 \
+  --timeout 300 \
+  --environment "Variables={BUCKET=$BUCKET,OUTPUT_PREFIX=feature_store/}" \
+  --description "Feature engineering: distance, log transforms, one-hot encoding"
+```
+
+### 13. Configure EventBridge to Trigger Feature Lambda
+```bash
+# Create EventBridge rule for processed/ uploads
+aws events put-rule \
+  --name s3-processed-upload-trigger \
+  --event-pattern '{
+    "source": ["aws.s3"],
+    "detail-type": ["Object Created"],
+    "detail": {
+      "bucket": {
+        "name": ["'$BUCKET'"]
+      },
+      "object": {
+        "key": [{
+          "prefix": "processed/"
+        }]
+      }
+    }
+  }' \
+  --state ENABLED
+
+# Add Lambda as target
+aws events put-targets \
+  --rule s3-processed-upload-trigger \
+  --targets "Id=1,Arn=arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:${FEATURE_FUNCTION_NAME}"
+
+# Grant EventBridge permission
+aws lambda add-permission \
+  --function-name $FEATURE_FUNCTION_NAME \
+  --statement-id eventbridge-feature-trigger \
+  --action lambda:InvokeFunction \
+  --principal events.amazonaws.com \
+  --source-arn arn:aws:events:${AWS_REGION}:${ACCOUNT_ID}:rule/s3-processed-upload-trigger
+```
+
 ## After this setup, the pipeline will:
 - ✅ Automatically trigger when files are uploaded to `s3://$BUCKET/raw/`
-- ✅ Clean data (remove price=0, standardize units)
-- ✅ Write cleaned data to `s3://$BUCKET/processed/`
+- ✅ Clean data (remove price=0, standardize units) → `processed/`
+- ✅ Automatically trigger feature engineering when cleaned data is ready
+- ✅ Build features (distance, log transforms, one-hot encoding) → `feature_store/`
 
