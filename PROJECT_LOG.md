@@ -58,7 +58,7 @@ Build an end-to-end Serverless Machine Learning (ML) pipeline that automates dat
 | Lambda for Cleaning | ✅ Done | EventBridge-triggered Lambda cleans data (removes price=0, standardizes units), outputs to processed/ |
 | Feature Engineering Lambda | ✅ Done | EventBridge-triggered Lambda builds features (distance to center, log transforms, one-hot encoding, interaction features), outputs to feature_store/ |
 | Step Functions Definition | 🔵 Planned | CDK stack to be created |
-| SageMaker Training Job | 🔵 Planned | XGBoost config needed |
+| SageMaker Training Job | ✅ Done | XGBoost training job completed successfully; model artifact stored in S3 (RMSE: 0.02977) |
 | Model Registration + Deployment | 🔵 Planned | DynamoDB integration |
 | Monitoring Dashboard | 🔵 Planned | CloudWatch metrics |
 | CloudWatch Alerts + Slack | 🔵 Planned | SNS webhook |

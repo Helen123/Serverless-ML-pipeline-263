@@ -192,6 +192,19 @@ def build_features(df):
         df_features['med_inc_squared'] = df_features['med_inc'] ** 2
         logger.info("Added med_inc_squared feature")
     
+    # Reorder columns: target column first (required by SageMaker XGBoost built-in container)
+    target_col = None
+    if 'price' in df_features.columns:
+        target_col = 'price'
+    elif 'MedHouseVal' in df_features.columns:
+        target_col = 'MedHouseVal'
+    
+    if target_col:
+        # Move target to first column
+        cols = [target_col] + [col for col in df_features.columns if col != target_col]
+        df_features = df_features[cols]
+        logger.info(f"Reordered columns: target '{target_col}' is now first column")
+    
     # Reset index
     df_features = df_features.reset_index(drop=True)
     

@@ -1,0 +1,51 @@
+{
+  "Comment": "ML Pipeline State Machine - Data Cleaning, Feature Engineering, and Training",
+  "StartAt": "DataUploaded",
+  "States": {
+    "DataUploaded": {
+      "Type": "Pass",
+      "Comment": "Entry point when data is uploaded to S3 raw/",
+      "Next": "CleanData"
+    },
+    "CleanData": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "CleanTransform",
+        "Payload": {
+          "bucket.$": "$.bucket",
+          "key.$": "$.key"
+        }
+      },
+      "ResultPath": "$.cleaning_result",
+      "Next": "FeatureEngineering"
+    },
+    "FeatureEngineering": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "FeatureBuild",
+        "Payload": {
+          "bucket.$": "$.cleaning_result.Payload.bucket",
+          "key.$": "$.cleaning_result.Payload.cleaned_key"
+        }
+      },
+      "ResultPath": "$.feature_result",
+      "Next": "TriggerTraining"
+    },
+    "TriggerTraining": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "TriggerTraining",
+        "Payload": {
+          "bucket.$": "$.feature_result.Payload.bucket",
+          "feature_key.$": "$.feature_result.Payload.features_key"
+        }
+      },
+      "ResultPath": "$.training_result",
+      "End": true
+    }
+  }
+}
+

@@ -306,9 +306,175 @@ aws lambda add-permission \
   --source-arn arn:aws:events:${AWS_REGION}:${ACCOUNT_ID}:rule/s3-processed-upload-trigger
 ```
 
+## Model Training Setup
+
+### 14. Create SageMaker Execution Role
+```bash
+export SAGEMAKER_ROLE_NAME=SageMakerExecutionRole
+
+# Create trust policy
+cat > /tmp/sagemaker-trust-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "sagemaker.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
+
+# Create the role
+aws iam create-role \
+  --role-name $SAGEMAKER_ROLE_NAME \
+  --assume-role-policy-document file:///tmp/sagemaker-trust-policy.json
+
+# Attach SageMaker execution policy
+aws iam attach-role-policy \
+  --role-name $SAGEMAKER_ROLE_NAME \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+
+# Create S3 access policy for SageMaker
+cat > /tmp/sagemaker-s3-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::${BUCKET}/feature_store/*",
+        "arn:aws:s3:::${BUCKET}/models/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": "arn:aws:s3:::${BUCKET}"
+    }
+  ]
+}
+EOF
+
+# Attach S3 policy
+aws iam put-role-policy \
+  --role-name $SAGEMAKER_ROLE_NAME \
+  --policy-name S3AccessPolicy \
+  --policy-document file:///tmp/sagemaker-s3-policy.json
+
+export SAGEMAKER_ROLE_ARN=$(aws iam get-role --role-name $SAGEMAKER_ROLE_NAME --query 'Role.Arn' --output text)
+```
+
+### 15. Create Trigger Training Lambda
+```bash
+export TRAINING_ROLE_NAME=TriggerTrainingLambdaRole
+export TRAINING_FUNCTION_NAME=TriggerTraining
+
+# Create IAM role for training trigger Lambda
+cat > /tmp/training-lambda-trust-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "lambda.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
+
+aws iam create-role \
+  --role-name $TRAINING_ROLE_NAME \
+  --assume-role-policy-document file:///tmp/training-lambda-trust-policy.json
+
+aws iam attach-role-policy \
+  --role-name $TRAINING_ROLE_NAME \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+# SageMaker access policy
+cat > /tmp/training-sagemaker-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "sagemaker:CreateTrainingJob",
+        "sagemaker:DescribeTrainingJob"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+EOF
+
+aws iam put-role-policy \
+  --role-name $TRAINING_ROLE_NAME \
+  --policy-name SageMakerAccessPolicy \
+  --policy-document file:///tmp/training-sagemaker-policy.json
+
+export TRAINING_ROLE_ARN=$(aws iam get-role --role-name $TRAINING_ROLE_NAME --query 'Role.Arn' --output text)
+
+# Package Lambda (zip deployment for simple Lambda)
+cd lambdas/trigger_training
+zip -r function.zip handler.py
+cd ../..
+
+# Create Lambda function
+aws lambda create-function \
+  --function-name $TRAINING_FUNCTION_NAME \
+  --runtime python3.11 \
+  --role $TRAINING_ROLE_ARN \
+  --handler handler.lambda_handler \
+  --zip-file fileb://lambdas/trigger_training/function.zip \
+  --timeout 300 \
+  --memory-size 256 \
+  --environment "Variables={SAGEMAKER_ROLE_ARN=$SAGEMAKER_ROLE_ARN,BUCKET=$BUCKET}"
+```
+
+### 16. Create Step Functions State Machine
+```bash
+# Create state machine from definition
+aws stepfunctions create-state-machine \
+  --name MLPipelineStateMachine \
+  --definition file://cdk/step_functions_definition.json \
+  --role-arn arn:aws:iam::${ACCOUNT_ID}:role/StepFunctionsExecutionRole
+
+# Note: You'll need to create StepFunctionsExecutionRole with permissions to invoke Lambdas and SageMaker
+```
+
+### 17. Test Training Job (Manual)
+```bash
+# Manually trigger training job for testing
+aws lambda invoke \
+  --function-name $TRAINING_FUNCTION_NAME \
+  --payload '{"bucket":"'$BUCKET'","feature_key":"feature_store/california_housing1_features.csv"}' \
+  /tmp/training-response.json
+
+cat /tmp/training-response.json
+
+# Monitor training job
+aws sagemaker describe-training-job --training-job-name <job-name-from-response>
+```
+
 ## After this setup, the pipeline will:
 - ✅ Automatically trigger when files are uploaded to `s3://$BUCKET/raw/`
 - ✅ Clean data (remove price=0, standardize units) → `processed/`
 - ✅ Automatically trigger feature engineering when cleaned data is ready
 - ✅ Build features (distance, log transforms, one-hot encoding) → `feature_store/`
+- ✅ Trigger SageMaker training job when features are ready
+- ✅ Train XGBoost model and save to `s3://$BUCKET/models/`
 
