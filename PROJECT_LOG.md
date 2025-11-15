@@ -59,7 +59,9 @@ Build an end-to-end Serverless Machine Learning (ML) pipeline that automates dat
 | Feature Engineering Lambda | ✅ Done | EventBridge-triggered Lambda builds features (distance to center, log transforms, one-hot encoding, interaction features), outputs to feature_store/ |
 | Step Functions Definition | 🔵 Planned | CDK stack to be created |
 | SageMaker Training Job | ✅ Done | XGBoost training job completed successfully; model artifact stored in S3 (RMSE: 0.02977) |
-| Model Registration + Deployment | 🔵 Planned | DynamoDB integration |
+| Model Registration + Deployment | ✅ Done | DynamoDB table created; RegisterModel Lambda writes metadata; DeployModel Lambda creates SageMaker serverless endpoints (default) |
+| Online Inference | ✅ Done | API Gateway → OnlineInfer Lambda → SageMaker Endpoint for real-time predictions |
+| Batch Inference | ✅ Done | EventBridge-triggered BatchInfer Lambda → SageMaker Batch Transform → S3 predicted/ output |
 | Monitoring Dashboard | 🔵 Planned | CloudWatch metrics |
 | CloudWatch Alerts + Slack | 🔵 Planned | SNS webhook |
 
