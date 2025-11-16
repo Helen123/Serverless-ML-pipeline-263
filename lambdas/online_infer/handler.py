@@ -181,52 +181,50 @@ def features_to_csv(features):
     Note: During training, target (price) is first column, but during inference,
     we only provide features in the same order (excluding target).
     
-    Column order must match feature_build Lambda output (excluding target):
-    All features in the order they appear after the target column
+    Based on actual training data, the feature order (excluding target) is:
+    1. med_inc
+    2. house_age
+    3. ave_rooms
+    4. ave_bedrms
+    5. population
+    6. ave_occup
+    7. latitude
+    8. longitude
+    9. distance_to_center_km
+    10. log_price (we'll use 0 since we don't have price)
+    11. price_per_age (we'll use 0 since we don't have price)
+    12. rooms_per_bedroom
+    13. population_density
+    14. med_inc_squared
     """
-    # Define column order (must match feature_build Lambda output, excluding target)
-    # Based on feature_build logic, the order after target removal is:
-    # Original columns (excluding target) + engineered features in order of creation
-    
-    # Base columns (from cleaned data, excluding target)
-    base_columns = [
-        'area_sqm', 'latitude', 'longitude', 'house_age', 'med_inc',
-        'ave_rooms', 'ave_bedrms', 'population', 'ave_occup'
+    # Column order matching training data (14 features, excluding target 'price')
+    # This matches the actual training data structure
+    columns = [
+        'med_inc',              # 1
+        'house_age',            # 2
+        'ave_rooms',            # 3
+        'ave_bedrms',           # 4
+        'population',           # 5
+        'ave_occup',            # 6
+        'latitude',             # 7
+        'longitude',            # 8
+        'distance_to_center_km', # 9
+        'log_price',            # 10 (we don't have price, use 0)
+        'price_per_age',        # 11 (we don't have price, use 0)
+        'rooms_per_bedroom',    # 12
+        'population_density',   # 13
+        'med_inc_squared'      # 14
     ]
-    
-    # Engineered features (in order of creation from feature_build)
-    engineered_columns = [
-        'distance_to_center_km',  # Added first
-        'area_sqm_squared',       # Added second
-        'log_area_sqm',           # Added third
-        'log_price',              # Added if price exists (we skip for inference)
-        'med_inc_squared',        # Added later
-        'price_per_sqm',         # Interaction feature (requires price, skip for inference)
-        'price_per_age',          # Interaction feature (requires price, skip for inference)
-        'rooms_per_bedroom',      # Room ratio
-        'population_density'      # Population ratio
-    ]
-    
-    # One-hot encoded columns (dynamic, depends on house_type values in training data)
-    # We'll include common ones, but this should match training data
-    one_hot_columns = [
-        'house_type_apartment', 'house_type_house', 'house_type_townhouse'
-    ]
-    
-    # Final column order (excluding target and price-dependent features)
-    columns = base_columns + [
-        'distance_to_center_km',
-        'area_sqm_squared',
-        'log_area_sqm',
-        'med_inc_squared',
-        'rooms_per_bedroom',
-        'population_density'
-    ] + one_hot_columns
     
     # Create CSV row with values (use 0 for missing features)
     values = []
     for col in columns:
-        val = features.get(col, 0)
+        # For price-dependent features, use 0 since we don't have price
+        if col in ['log_price', 'price_per_age']:
+            val = 0
+        else:
+            val = features.get(col, 0)
+        
         # Handle NaN or None
         if val is None or (isinstance(val, float) and (val != val)):  # NaN check
             val = 0
