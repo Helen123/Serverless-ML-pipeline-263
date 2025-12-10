@@ -1,13 +1,18 @@
 """
 Lambda Handler for Batch Inference
 Triggers SageMaker Batch Transform job when data is uploaded to S3 to_infer/
+Applies feature engineering to raw CSV before batch transform
 """
 
 import json
 import os
 import boto3
 import logging
+import pandas as pd
+import numpy as np
 from datetime import datetime
+from io import BytesIO
+from math import radians, sin, cos, sqrt, atan2
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -59,6 +64,15 @@ def lambda_handler(event, context):
                 'message': f"Skipped: {input_key} (not in to_infer/)"
             }
         
+        # Skip intermediate files created by this Lambda (to prevent infinite loops)
+        filename = input_key.split('/')[-1]
+        if '_no_header' in filename or '_features' in filename:
+            logger.info(f"Skipping intermediate file created by Lambda: {input_key}")
+            return {
+                'statusCode': 200,
+                'message': f"Skipped: {input_key} (intermediate file)"
+            }
+        
         logger.info(f"Processing batch inference for: s3://{bucket}/{input_key}")
         
         # Get model name or endpoint name
@@ -67,9 +81,81 @@ def lambda_handler(event, context):
         
         if not model_name and not endpoint_name:
             # Try to get from DynamoDB (latest deployed model)
+            # This will get the endpoint_name from DynamoDB, then query SageMaker for the actual model name
             model_name = get_latest_model_name()
             if not model_name:
                 raise ValueError("No model_name or endpoint_name provided, and no model found in DynamoDB")
+        
+        # If endpoint_name is provided but not model_name, get model name from endpoint config
+        if endpoint_name and not model_name:
+            model_name = get_model_name_from_endpoint(endpoint_name)
+            if not model_name:
+                raise ValueError(f"Could not find model name for endpoint: {endpoint_name}")
+        
+        # Step 1: Check if data is already feature-engineered or needs feature engineering
+        # If file already has feature-engineered columns (e.g., distance_to_center_km, med_inc_squared),
+        # skip feature engineering and use it directly
+        logger.info("Step 1: Checking if data needs feature engineering...")
+        
+        # Download a sample to check columns
+        sample_response = s3_client.get_object(Bucket=bucket, Key=input_key)
+        sample_df = pd.read_csv(BytesIO(sample_response['Body'].read()), nrows=1)
+        sample_columns = list(sample_df.columns)
+        
+        # Check if it's already feature-engineered (has distance_to_center_km or med_inc_squared)
+        is_feature_engineered = 'distance_to_center_km' in sample_columns or 'med_inc_squared' in sample_columns
+        
+        if is_feature_engineered:
+            logger.info("Data is already feature-engineered, but need to remove header and target column for batch transform")
+            # Batch transform expects:
+            # 1. No header
+            # 2. Only features (14 columns), NOT the target column 'price'
+            # Read the file and process it
+            response = s3_client.get_object(Bucket=bucket, Key=input_key)
+            df = pd.read_csv(BytesIO(response['Body'].read()))
+            
+            # Remove target column if present (XGBoost batch transform doesn't expect it)
+            if 'price' in df.columns:
+                df = df.drop(columns=['price'])
+                logger.info("Removed 'price' column from feature-engineered data for batch transform")
+            
+            # Feature order (14 features, excluding target)
+            feature_column_order = [
+                'med_inc', 'house_age', 'ave_rooms', 'ave_bedrms', 'population', 'ave_occup',
+                'latitude', 'longitude',
+                'distance_to_center_km', 'log_price', 'price_per_age',
+                'rooms_per_bedroom', 'population_density', 'med_inc_squared'
+            ]
+            
+            # Reorder columns to match expected feature order
+            df_output = pd.DataFrame()
+            for col in feature_column_order:
+                if col in df.columns:
+                    df_output[col] = df[col]
+                else:
+                    df_output[col] = 0
+            
+            df_output = df_output[feature_column_order]
+            
+            # Save without header for batch transform
+            csv_buffer = BytesIO()
+            df_output.to_csv(csv_buffer, index=False, header=False)
+            csv_buffer.seek(0)
+            
+            # Save to temp location (outside to_infer/ to avoid retriggering)
+            temp_key = f"temp_batch/{input_key.split('/')[-1].replace('.csv', '_no_header.csv')}"
+            s3_client.put_object(
+                Bucket=bucket,
+                Key=temp_key,
+                Body=csv_buffer.getvalue(),
+                ContentType='text/csv'
+            )
+            logger.info(f"Saved file without header and target column to: s3://{bucket}/{temp_key}")
+            feature_engineered_key = temp_key
+        else:
+            logger.info("Data is raw, applying feature engineering...")
+            feature_engineered_key = apply_feature_engineering(bucket, input_key)
+            logger.info(f"Feature engineering complete. Processed file: s3://{bucket}/{feature_engineered_key}")
         
         # Generate output path
         output_prefix = event.get('output_prefix', 'predicted/')
@@ -91,10 +177,10 @@ def lambda_handler(event, context):
             logger.info(f"Using endpoint for batch inference: {endpoint_name}")
             # Note: For large batch jobs, Batch Transform is more efficient
             # But we can also use the endpoint with async inference
-            return invoke_batch_via_endpoint(endpoint_name, bucket, input_key, output_key)
+            return invoke_batch_via_endpoint(endpoint_name, bucket, feature_engineered_key, output_key)
         else:
             # Use Batch Transform (recommended for large batches)
-            logger.info(f"Creating Batch Transform job: {job_name}")
+            logger.info(f"Step 2: Creating Batch Transform job: {job_name}")
             
             transform_job_params = {
                 'TransformJobName': job_name,
@@ -106,7 +192,7 @@ def lambda_handler(event, context):
                     'DataSource': {
                         'S3DataSource': {
                             'S3DataType': 'S3Prefix',
-                            'S3Uri': f's3://{bucket}/{input_key}'
+                            'S3Uri': f's3://{bucket}/{feature_engineered_key}'
                         }
                     },
                     'ContentType': 'text/csv'
@@ -129,7 +215,7 @@ def lambda_handler(event, context):
                 'statusCode': 200,
                 'transform_job_name': job_name,
                 'transform_job_arn': response['TransformJobArn'],
-                'input_s3_uri': f's3://{bucket}/{input_key}',
+                'input_s3_uri': f's3://{bucket}/{feature_engineered_key}',
                 'output_s3_uri': f's3://{bucket}/{output_prefix}',
                 'status': 'InProgress'
             }
@@ -144,15 +230,19 @@ def lambda_handler(event, context):
         }
 
 def get_latest_model_name():
-    """Get the latest deployed model name from DynamoDB"""
+    """
+    Get the latest deployed model name from DynamoDB.
+    Returns the actual SageMaker model name by:
+    1. Getting endpoint_name from DynamoDB
+    2. Querying SageMaker endpoint config to get the model name
+    """
     try:
         import boto3
         dynamodb = boto3.resource('dynamodb')
         table_name = os.environ.get('MODEL_TABLE_NAME', 'ml-pipeline-models')
         table = dynamodb.Table(table_name)
         
-        # Scan for deployed models (this is a simple approach)
-        # In production, you might want to use GSI or query by is_deployed
+        # Scan for deployed models
         response = table.scan(
             FilterExpression='is_deployed = :deployed',
             ExpressionAttributeValues={':deployed': True}
@@ -160,18 +250,182 @@ def get_latest_model_name():
         
         if response['Items']:
             # Sort by created_timestamp descending and get the latest
-            items = sorted(response['Items'], key=lambda x: x.get('created_timestamp', 0), reverse=True)
+            # Note: boto3 resource converts DynamoDB types automatically, so we can access directly
+            items = sorted(
+                response['Items'], 
+                key=lambda x: int(x.get('created_timestamp', 0)) if isinstance(x.get('created_timestamp'), (int, str)) else 0, 
+                reverse=True
+            )
             if items:
-                # Extract model name from model_artifact_s3_uri or use training_job_name
-                # For SageMaker, we need the model name, not the training job name
-                # We'll need to construct it or store it in DynamoDB
-                # For now, return None and require explicit model_name
-                return None
+                latest_item = items[0]
+                # Get endpoint_name from DynamoDB (boto3 resource format - direct access)
+                endpoint_name = latest_item.get('endpoint_name')
+                if endpoint_name:
+                    # Query SageMaker to get the actual model name from endpoint config
+                    logger.info(f"Found endpoint in DynamoDB: {endpoint_name}, querying SageMaker for model name...")
+                    return get_model_name_from_endpoint(endpoint_name)
         
         return None
     except Exception as e:
         logger.warning(f"Could not fetch model from DynamoDB: {str(e)}")
         return None
+
+def get_model_name_from_endpoint(endpoint_name):
+    """
+    Get the SageMaker model name from an endpoint configuration.
+    This queries the endpoint config to find which model is deployed.
+    """
+    try:
+        # Describe the endpoint to get its config name
+        endpoint_response = sagemaker_client.describe_endpoint(EndpointName=endpoint_name)
+        endpoint_config_name = endpoint_response['EndpointConfigName']
+        
+        # Describe the endpoint config to get the model name
+        config_response = sagemaker_client.describe_endpoint_config(EndpointConfigName=endpoint_config_name)
+        
+        # Get model name from the first production variant
+        if config_response.get('ProductionVariants'):
+            model_name = config_response['ProductionVariants'][0]['ModelName']
+            logger.info(f"Found model name from endpoint {endpoint_name}: {model_name}")
+            return model_name
+        
+        return None
+    except Exception as e:
+        logger.error(f"Could not get model name from endpoint {endpoint_name}: {str(e)}")
+        return None
+
+def apply_feature_engineering(bucket, input_key):
+    """
+    Apply feature engineering to raw CSV file and save to temporary S3 location.
+    Returns the S3 key of the feature-engineered file.
+    """
+    try:
+        # Read raw CSV from S3
+        logger.info(f"Reading raw CSV from s3://{bucket}/{input_key}")
+        response = s3_client.get_object(Bucket=bucket, Key=input_key)
+        df = pd.read_csv(BytesIO(response['Body'].read()))
+        
+        logger.info(f"Raw data shape: {df.shape}, columns: {list(df.columns)}")
+        
+        # Apply feature engineering (same logic as feature_build Lambda)
+        df_features = build_features_for_inference(df)
+        
+        logger.info(f"Feature-engineered data shape: {df_features.shape}")
+        
+        # Save to temporary S3 location (in temp_batch/ to avoid retriggering EventBridge)
+        input_filename = input_key.split('/')[-1]
+        feature_key = f"temp_batch/{input_filename.replace('.csv', '_features.csv')}"
+        
+        # Convert to CSV matching the exact training format
+        # Training data has 15 columns with price in position 9
+        # Order: med_inc, house_age, ave_rooms, ave_bedrms, population, ave_occup,
+        #        latitude, longitude, price, distance_to_center_km, log_price, 
+        #        price_per_age, rooms_per_bedroom, population_density, med_inc_squared
+        csv_buffer = BytesIO()
+        
+        # For batch transform, XGBoost expects ONLY features (14 columns), NOT the target column
+        # The model was trained with price as first column, but during inference we exclude it
+        # Feature order (14 features, excluding target 'price'):
+        feature_column_order = [
+            'med_inc', 'house_age', 'ave_rooms', 'ave_bedrms', 'population', 'ave_occup',
+            'latitude', 'longitude',
+            'distance_to_center_km', 'log_price', 'price_per_age',
+            'rooms_per_bedroom', 'population_density', 'med_inc_squared'
+        ]
+        
+        # Create output dataframe with only features (no target column)
+        df_output = pd.DataFrame()
+        for col in feature_column_order:
+            if col in df_features.columns:
+                df_output[col] = df_features[col]
+            else:
+                # Missing feature, use 0
+                df_output[col] = 0
+        
+        # Ensure correct order (14 features only)
+        df_output = df_output[feature_column_order]
+        
+        # Fill NaN values with 0
+        df_output = df_output.fillna(0)
+        
+        # Write CSV without header (Batch Transform expects no header)
+        df_output.to_csv(csv_buffer, index=False, header=False)
+        csv_buffer.seek(0)
+        
+        # Upload to S3
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=feature_key,
+            Body=csv_buffer.getvalue(),
+            ContentType='text/csv'
+        )
+        
+        logger.info(f"Feature-engineered CSV saved to: s3://{bucket}/{feature_key}")
+        return feature_key
+        
+    except Exception as e:
+        logger.error(f"Error applying feature engineering: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise
+
+def build_features_for_inference(df):
+    """
+    Build features from raw data for inference (no target column).
+    Same feature engineering as training, but without price-dependent features.
+    """
+    df_features = df.copy()
+    
+    # 1. Calculate distance to city center
+    if 'latitude' in df_features.columns and 'longitude' in df_features.columns:
+        city_center_lat = 37.7749  # San Francisco
+        city_center_lon = -122.4194
+        
+        df_features['distance_to_center_km'] = df_features.apply(
+            lambda row: haversine_distance(
+                row['latitude'], row['longitude'],
+                city_center_lat, city_center_lon
+            ),
+            axis=1
+        )
+    
+    # 2. Log transform for area (if exists)
+    if 'area_sqm' in df_features.columns:
+        df_features['log_area_sqm'] = np.log1p(df_features['area_sqm'])
+        df_features['area_sqm_squared'] = df_features['area_sqm'] ** 2
+    
+    # 3. One-hot encoding for house_type
+    if 'house_type' in df_features.columns:
+        house_type_dummies = pd.get_dummies(df_features['house_type'], prefix='house_type', dummy_na=False)
+        df_features = pd.concat([df_features, house_type_dummies], axis=1)
+        df_features = df_features.drop(columns=['house_type'])
+    
+    # 4. Interaction features (without price)
+    if 'ave_rooms' in df_features.columns and 'ave_bedrms' in df_features.columns:
+        df_features['rooms_per_bedroom'] = df_features['ave_rooms'] / (df_features['ave_bedrms'] + 1e-6)
+    
+    if 'population' in df_features.columns and 'ave_occup' in df_features.columns:
+        df_features['population_density'] = df_features['population'] / (df_features['ave_occup'] + 1e-6)
+    
+    # 5. Polynomial features
+    if 'med_inc' in df_features.columns:
+        df_features['med_inc_squared'] = df_features['med_inc'] ** 2
+    
+    # Add placeholder columns for price-dependent features (will be 0 for inference)
+    df_features['log_price'] = 0
+    df_features['price_per_age'] = 0
+    
+    return df_features
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """Calculate distance between two points in kilometers using Haversine formula"""
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1-a))
+    R = 6371.0  # Earth radius in km
+    return R * c
 
 def invoke_batch_via_endpoint(endpoint_name, bucket, input_key, output_key):
     """

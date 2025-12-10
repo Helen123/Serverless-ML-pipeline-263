@@ -9,6 +9,8 @@ import boto3
 import logging
 import csv
 import io
+import time
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -56,12 +58,43 @@ def lambda_handler(event, context):
         
         logger.info(f"Invoking endpoint: {endpoint_name} with features: {features}")
         
-        # Invoke SageMaker endpoint
-        response = sagemaker_runtime.invoke_endpoint(
-            EndpointName=endpoint_name,
-            ContentType='text/csv',
-            Body=csv_data.encode('utf-8')
-        )
+        # Invoke SageMaker endpoint with retry logic for ModelNotReadyException
+        # Serverless endpoints can take time to initialize on cold start
+        max_retries = 5
+        retry_delay = 2  # Start with 2 seconds
+        
+        response = None
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                response = sagemaker_runtime.invoke_endpoint(
+                    EndpointName=endpoint_name,
+                    ContentType='text/csv',
+                    Body=csv_data.encode('utf-8')
+                )
+                break  # Success, exit retry loop
+            except ClientError as e:
+                error_code = e.response.get('Error', {}).get('Code', '')
+                error_message = e.response.get('Error', {}).get('Message', '')
+                
+                # Check if it's a ModelNotReadyException
+                if 'ModelNotReadyException' in error_code or 'ModelNotReadyException' in error_message:
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
+                        logger.warning(f"Model not ready (attempt {attempt + 1}/{max_retries}), waiting {wait_time}s...")
+                        time.sleep(wait_time)
+                        last_error = e
+                        continue
+                    else:
+                        # Last attempt failed
+                        raise Exception(f"Endpoint not ready after {max_retries} attempts: {error_message}")
+                else:
+                    # Different error, don't retry
+                    raise
+        
+        if response is None:
+            raise Exception(f"Failed to invoke endpoint after {max_retries} attempts: {str(last_error)}")
         
         # Parse prediction result
         prediction_result = response['Body'].read().decode('utf-8')
@@ -112,16 +145,20 @@ def extract_and_engineer_features(request_data):
     
     features = {}
     
-    # Extract base features
-    features['area_sqm'] = float(request_data.get('area_sqm', request_data.get('area_sqft', 0)) * 0.092903)  # Convert sqft to sqm if needed
-    features['latitude'] = float(request_data.get('latitude', 0))
-    features['longitude'] = float(request_data.get('longitude', 0))
+    # Extract base features (California Housing dataset format)
+    # Note: California Housing does NOT have area_sqm, so we don't create it
+    features['latitude'] = float(request_data.get('latitude', request_data.get('Latitude', 0)))
+    features['longitude'] = float(request_data.get('longitude', request_data.get('Longitude', 0)))
     features['house_age'] = float(request_data.get('house_age', request_data.get('HouseAge', 0)))
     features['med_inc'] = float(request_data.get('med_inc', request_data.get('MedInc', 0)))
     features['ave_rooms'] = float(request_data.get('ave_rooms', request_data.get('AveRooms', 0)))
     features['ave_bedrms'] = float(request_data.get('ave_bedrms', request_data.get('AveBedrms', 0)))
     features['population'] = float(request_data.get('population', request_data.get('Population', 0)))
     features['ave_occup'] = float(request_data.get('ave_occup', request_data.get('AveOccup', 0)))
+    
+    # Optional: area_sqm only if provided (for other datasets)
+    if 'area_sqm' in request_data or 'area_sqft' in request_data:
+        features['area_sqm'] = float(request_data.get('area_sqm', request_data.get('area_sqft', 0) * 0.092903))
     
     # Feature engineering (matching feature_build Lambda)
     # Distance to center (San Francisco: 37.7749, -122.4194)
@@ -131,24 +168,25 @@ def extract_and_engineer_features(request_data):
         center_lat, center_lon
     )
     
-    # Log transforms
-    features['log_area_sqm'] = math.log1p(features['area_sqm'])
+    # Log transforms (only if area_sqm exists)
+    if 'area_sqm' in features:
+        features['log_area_sqm'] = math.log1p(features['area_sqm'])
+        features['area_sqm_squared'] = features['area_sqm'] ** 2
     # Note: We don't have price in the request, so we skip log_price
     
     # Squared features
-    features['area_sqm_squared'] = features['area_sqm'] ** 2
     features['med_inc_squared'] = features['med_inc'] ** 2
     
     # Interaction features (skip price-dependent ones for inference)
     # price_per_sqm and price_per_age require price, so we skip them
     
-    # Room ratio
+    # Room ratio (for California Housing dataset)
     if features['ave_bedrms'] > 0:
         features['rooms_per_bedroom'] = features['ave_rooms'] / features['ave_bedrms']
     else:
         features['rooms_per_bedroom'] = 0
     
-    # Population density
+    # Population density (for California Housing dataset)
     if features['ave_occup'] > 0:
         features['population_density'] = features['population'] / features['ave_occup']
     else:
